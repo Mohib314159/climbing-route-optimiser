@@ -1,100 +1,61 @@
-# Climbing Crux Model — V2 Route Generator
+# ClimbingCrux — Route Optimiser
 
-Drop-in upgrade for [climbingcrux_model](https://github.com/mkurc1/climbingcrux_model).
+Built on top of [mkurc1/climbingcrux_model](https://github.com/mkurc1/climbingcrux_model), which handles the computer vision side (YOLOv9 hold detection, ArUco distance calibration, OpenCV rendering). That part is untouched. What I replaced is the route generation — the original picks holds randomly, which means you get a different route every run and there's no sense of difficulty or optimality. This version replaces that with something more principled.
 
-## What changes
+## What's new
 
-Two files replace two existing files. Everything else (YOLO detection, ArUco calibration, OpenCV rendering, Docker setup) stays identical.
+Two files replace two from the original:
 
-| Original | Replaced by |
-|----------|-------------|
-| `src/route_generator.py` | `src/route_generator_v2.py` |
-| `main.py` | `main_v2.py` |
+- `src/route_generator.py` → `src/route_generator_v2.py`
+- `main.py` → `main_v2.py`
 
-## Installation
+Everything else (Docker, ArUco, YOLO, the drawing code) stays the same.
+
+## Setup
+
+Clone the original repo first, then drop in the two new files:
 
 ```bash
-# Clone the original repo
 git clone https://github.com/mkurc1/climbingcrux_model
 cd climbingcrux_model
-
-# Copy the two new files in
 cp route_generator_v2.py src/
 cp main_v2.py .
-
-# Run
+pip install fastapi uvicorn opencv-python python-dotenv imutils ultralytics python-multipart
 uvicorn main_v2:app --reload --port 8000
 ```
 
-## API changes
+Swagger docs at `http://localhost:8000/docs`.
 
-### `POST /boulder/generate` (same endpoint, new params)
+## How the route generation works
 
-```bash
-# Original — no climber personalisation
-curl -X POST /boulder/generate -F "file=@wall.jpg"
+**Original:** at each step, candidates within a radius zone are collected and one is picked with `np.random.choice`. No difficulty weighting, no optimisation — just a random walk upward.
 
-# V2 — personalised to climber
-curl -X POST "/boulder/generate?climber_height_cm=182&climber_grade=V5&climber_wingspan_cm=188" \
-  -F "file=@wall.jpg"
-```
+**This version:**
 
-Returns: same as before annotated PNG image with stick figures. Crux moves highlighted orange.
+Each detected hold gets a difficulty score between 0 and 1, estimated from three things: bounding box size (smaller holds are harder), height on the wall (route setters tend to place harder moves higher up), and hold class (volumes are generally easier than individual holds).
 
-### `POST /boulder/analyse` (new endpoint)
+The wall is then treated as a directed acyclic graph — holds are nodes, and there's an edge from hold A to hold B if B is above A and within the climber's reach. Edge weight combines hold difficulty and move distance. A single forward DP pass (O(n²) in number of holds) finds the minimum-cost path from any start hold to any finish hold. Same input always gives the same output.
 
-```bash
-curl -X POST "/boulder/analyse?climber_height_cm=182&climber_grade=V5" \
-  -F "file=@wall.jpg"
-```
+Reach is personalised: max reach = (wingspan / 2) × 1.15, where the 1.15 accounts for dynamic moves. A 190cm climber with long arms reaches holds that a 165cm climber simply can't, so their optimal routes genuinely differ.
 
-Returns JSON:
-```json
-{
-  "route": {
-    "n_moves": 9,
-    "total_cost": 4.823,
-    "grade_estimate": "V5",
-    "crux_move_index": 6,
-    "hold_indices": [3, 8, 12, 19, 24, 31, 38, 44, 51]
-  },
-  "climber": {
-    "height_cm": 182,
-    "wingspan_cm": 188,
-    "grade": "V5",
-    "send_rate": 0.341
-  },
-  "annotated_image_png_b64": "..."
-}
-```
+Once the route is found, 10,000 climbing attempts are simulated. Each move succeeds with probability sigmoid(8 × (skill - move_cost)), which is the same model used in psychometrics to relate question difficulty to student ability (Item Response Theory). The output is a send rate — the fraction of simulated attempts that top out.
 
-## What's different:
+Body position at each hold is estimated geometrically using standard anatomy ratios (arm ≈ 3.5 head lengths, leg ≈ 4 head lengths) to place shoulders, elbows, hips, knees, and feet. The crux move gets highlighted in orange.
 
-### Original route generation
-At each step, selects foot and hand holds randomly from candidates within a spatial zone. Produces a different route on every call. No difficulty model: all holds are treated equally.
+## API
 
-### V2 route generation
+`POST /boulder/generate` — same as original but now accepts `climber_height_cm`, `climber_wingspan_cm`, and `climber_grade` as query params. Returns annotated PNG.
 
-1. Difficulty estimation
-Each hold gets a difficulty score in [0, 1] estimated from:
-- Bounding box size (smaller = harder)
-- Height on wall (higher = harder)
-- Hold class (volumes easier than individual holds)
+`POST /boulder/analyse` — returns JSON with grade estimate, send rate, crux move index, and base64-encoded annotated image.
 
-2. Dynamic programming (optimal route)
-The wall is modelled as a DAG. Nodes = holds, edges = reachable moves (within climber's reach, upward only). Edge weight = `0.7 × difficulty + 0.3 × normalised_distance`. A single forward DP pass finds the minimum-cost path. Deterministic — same input always gives same output.
+`POST /boulder/generate-colour` — accepts a `route_colour` param (red, blue, yellow, green, purple, orange) and filters to only holds of that colour before solving. Useful on walls where routes are colour-coded.
 
-3. Personalised biomechanics
-Max reach = `(wingspan / 2) × 1.15` (15% dynamic reach bonus). A taller climber with longer wingspan can reach holds a shorter climber cannot. The difficulty model scales relative to the climber's grade.
+`POST /boulder/compare` — takes two climber profiles and returns both optimal routes overlaid on the same image. Shows how height and grade affect which holds get used.
 
-4. Monte Carlo send rate
-10,000 simulated attempts. Each move succeeds with probability `sigmoid(8 × (skill − move_cost))` — the Item Response Theory model. Reports what percentage of attempts complete the route.
-
-5. Anatomically-accurate IK body positions
-Body joint positions are computed geometrically from hand hold positions using anatomy ratios (head/8, arm = 3.5 heads, leg = 4 heads). Crux moves highlighted in orange.
+`POST /wall/colours` — no route generation, just identifies which colours are on the wall and returns counts. Good first step before calling generate-colour.
 
 ## Attribution
 
-Original YOLO detection pipeline, ArUco calibration, and OpenCV rendering: [mkurc1/climbingcrux_model](https://github.com/mkurc1/climbingcrux_model), MIT License.
+YOLO detection, ArUco calibration, OpenCV rendering, and all original infrastructure: [mkurc1/climbingcrux_model](https://github.com/mkurc1/climbingcrux_model), MIT licence.
 
-Route optimisation engine, difficulty model, Monte Carlo simulation, and IK body positioning: original work.
+Route optimisation, difficulty estimation, Monte Carlo simulation, colour filtering, and IK body positioning: original work.
