@@ -1,0 +1,7 @@
+train: datasets/images/train #train images
+val: datasets/images/val #validation images
+
+# Classes
+names:
+  0: hold
+  1: volume
